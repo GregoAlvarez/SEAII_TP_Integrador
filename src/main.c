@@ -27,7 +27,6 @@ void app_main(void)
     // Inicializa comunicación Modbus
     if (modbus_comm_init() != ESP_OK) {
         ESP_LOGE(TAG, "Error inicializando Modbus");
-        //TODO: implementar mecanismo de aviso de error de inicializacion (por fuera de las tareas)
         return;
     }
 
