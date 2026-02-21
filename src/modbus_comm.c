@@ -3,24 +3,6 @@ modbus_comm.c
 Implementación del módulo de comunicación Modbus RTU
  */
 
- /*
- * NOTA SOBRE ACCESO CONCURRENTE A HOLDING REGISTERS
- * 
- * En el proyecto se protege el acceso a los HR mediante hr_mutex entre las tareas del firmware.
- * Sin embargo, la librería esp-modbus accede directamente al array cuando el maestro lee/escribe,
- * sin respetar el mismo mutex, usa una protección propia.
- * 
- * Esto podría causar lecturas inconsistentes si el maestro lee los registros de datos IMU 
- * exactamente mientras se actualizan, obteniendo valores de distintas muestras mezclados.
- * 
- * En el contecto del TP esto no implica un problema significativo porque:
- * - La ventana en cuestión es de microsegundos
- * - Los registros de estado son atómicos (uint16_t) por lo que no se puede corromper el dato en sí
- * - Los datos de la imu pueden actualizarse varias veces más rapido que la lectura del operador
- */
-
-
-
 #include "modbus_comm.h"
 #include "config/pin_config.h"
 #include "config/modbus_map.h"
@@ -41,7 +23,6 @@ static const char *TAG = "MODBUS_COMM";     // Tag de debug
 // ============================================
 static uint16_t holding_regs[HR_TOTAL_COUNT] = {0}; //Se inicinalizan en 0, congruente con sus finciones
 static void *modbus_ctx = NULL;
-static SemaphoreHandle_t hr_mutex = NULL;
 static QueueHandle_t cmd_queue = NULL;
 static QueueHandle_t status_queue = NULL;
 static TaskHandle_t modbus_task_events_handle = NULL;
@@ -64,13 +45,6 @@ static void update_config_valid(void);
 //Se incializa la comunicación modbus y recursos asociados
 esp_err_t modbus_comm_init(void)
 {
-    // Mutex para proteger acceso holding registers
-    hr_mutex = xSemaphoreCreateMutex();
-    if (hr_mutex == NULL) {
-        ESP_LOGE(TAG, "Error creando hr_mutex");
-        return ESP_FAIL;
-    }
-
     // Cola de comandos (Modbus_Events produce -> System Manager consume)
     cmd_queue = xQueueCreate(5, sizeof(uint16_t));
     if (cmd_queue == NULL) {
@@ -196,10 +170,10 @@ QueueHandle_t modbus_comm_get_status_queue(void)
 uint8_t modbus_comm_is_config_valid(void)
 {
     uint8_t valid = 0;
-    if (xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        valid = (uint8_t)holding_regs[HR_CONFIG_VALID];
-        xSemaphoreGive(hr_mutex);
-    }
+    mbc_slave_lock(modbus_ctx);
+    valid = (uint8_t)holding_regs[HR_CONFIG_VALID];
+    mbc_slave_unlock(modbus_ctx);
+
     return valid;
 }
 
@@ -207,10 +181,10 @@ uint8_t modbus_comm_is_config_valid(void)
 uint16_t modbus_comm_get_sample_period(void)
 {
     uint16_t period = 0;
-    if (xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        period = holding_regs[HR_IMU_SAMPLE_PERIOD];
-        xSemaphoreGive(hr_mutex);
-    }
+    mbc_slave_lock(modbus_ctx); // Tomo mutex de la librería para acceder a los HR
+    period = holding_regs[HR_IMU_SAMPLE_PERIOD];
+    mbc_slave_unlock(modbus_ctx);  //Librero mutex
+
     return period;
 }
 
@@ -264,12 +238,11 @@ static void process_modbus_events(void)
         // Hubo escritura en registro de comando
         if (info.mb_offset == HR_SYSTEM_COMMAND) {
             uint16_t cmd;
-            // Tomo semáforo para leer el registro. 
-            if (xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                cmd = (uint16_t)holding_regs[HR_SYSTEM_COMMAND]; // Buffereo el comando para procesarlo fuera de mutex
-                holding_regs[HR_SYSTEM_COMMAND] = CMD_IDLE;  // Reset comando, ya lo leí
-                xSemaphoreGive(hr_mutex); // Libero semáforo
-            }
+
+            mbc_slave_lock(modbus_ctx); // Tomo mutex de la librería para acceder a los HR
+            cmd = (uint16_t)holding_regs[HR_SYSTEM_COMMAND]; // Buffereo el comando para procesarlo fuera de mutex
+            holding_regs[HR_SYSTEM_COMMAND] = CMD_IDLE;  // Reset comando, ya lo leí
+            mbc_slave_unlock(modbus_ctx);   //libero mutex
             
             // Envío comando a System Manager
             if (xQueueSend(cmd_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) { //Se intenta enviar el comando a la cola con timeout
@@ -293,56 +266,16 @@ static void process_modbus_events(void)
 static void process_status_updates(void)
 {
     status_update_t update;
-    
-    //versión previa
-    /*
-    // Procesa todas las actualizaciones pendientes desde las otras tareas
-    while (xQueueReceive(status_queue, &update, 0) == pdTRUE) { //Bloqueante mientras la cola este vacía
-        
-        //Tomo el mutex para ecribir los HR
-        if (xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-            continue;//MAL: Si no puedo tomarlo, descarto el elemento de la cola (Y SI NO SE PUEDE TOMAR EL MUTEX ANTES DE LA PROXIMA ITERACIÓN, SE VACIA TODA LA COLA)
-        }
-
-        switch (update.type) {
-            case STATUS_UPDATE_STATE:
-                holding_regs[HR_SYSTEM_STATE] = update.data.state;
-                break;
-
-            case STATUS_UPDATE_CMD_STATUS:
-                holding_regs[HR_COMMAND_STATUS] = update.data.cmd_status;
-                break;
-
-            case STATUS_UPDATE_ERROR:
-                holding_regs[HR_ERROR_CODE] = update.data.error_code;
-                break;
-
-            case STATUS_UPDATE_IMU_DATA:
-                holding_regs[HR_IMU_ACCEL_X] = (uint16_t)update.data.imu_data.accel_x;
-                holding_regs[HR_IMU_ACCEL_Y] = (uint16_t)update.data.imu_data.accel_y;
-                holding_regs[HR_IMU_ACCEL_Z] = (uint16_t)update.data.imu_data.accel_z;
-                holding_regs[HR_IMU_SAMPLE_COUNT] = update.data.imu_data.sample_count;
-                break;
-        }
-
-        xSemaphoreGive(hr_mutex);
-    }
-    */
-
     // Pispea la cola para ver si hay elementos. Si no hay, se bloquea la tarea hasta que haya. Si hay, entra para procesar de a uno.
     // Esto no extrae un elemento de la cola, solo lo lee. Evita que se extraiga un elemento sin saber si se podrá procesar.
     while (xQueuePeek(status_queue, &update, portMAX_DELAY) == pdTRUE){
         
-        //Si hay un elemento, intento tomar el mutex para acceder a los HR. Si no puedo tomarlo por un tiempo, logueo error. 
-        //Podría usarse bloqueo infinito (sería mejor), pero si no se libera mutex nunca se ejecuta y no me entero.
-        if(xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(500)) != pdTRUE){
-            ESP_LOGW(TAG, "No se pudo tomar hr_mutex para actualizar status por 500ms");
-            continue;
-        }
+        mbc_slave_lock(modbus_ctx); // Tomo mutex de la librería para acceder a los HR
 
         //Si puedo tomar el mutex, extraigo el elemento de la cola para procesarlo.
         if(xQueueReceive(status_queue,&update,0)!= pdTRUE){
-            xSemaphoreGive(hr_mutex);   //Si no pude extraerlo, libero el mutex y paso a la siguiente iteracion. 
+            //xSemaphoreGive(hr_mutex);   //Si no pude extraerlo, libero el mutex y paso a la siguiente iteracion. 
+            mbc_slave_unlock(modbus_ctx); //Si no pude extraerlo, libero el mutex y paso a la siguiente iteracion. 
             ESP_LOGE(TAG, "No se pudo extraer el elemento de la cola");  //Esto no debería suceder nunca ya que solo esta tarea consume de la cola, entonces no habría forma de que otra "robe" elementos en el interín.
             continue; //Si no puedo recibir el elemento, libero el mutex y paso a la siguiente iteración (no debería pasar porque peek me aseguró que había un elemento, pero por las dudas lo manejo)
         }
@@ -369,7 +302,7 @@ static void process_status_updates(void)
                 break;
         }
 
-        xSemaphoreGive(hr_mutex);
+        mbc_slave_unlock(modbus_ctx); //libero mutex
     }
     
 }
@@ -379,18 +312,15 @@ Actualiza el flag CONFIG_VALID basándose en el período de muestreo. CONFIG_VAL
  */
 static void update_config_valid(void)
 {
-    if (xSemaphoreTake(hr_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {   //Mutex para acceder HR
-        uint16_t period = holding_regs[HR_IMU_SAMPLE_PERIOD];
-        
-        if (period >= IMU_SAMPLE_PERIOD_MIN && period <= IMU_SAMPLE_PERIOD_MAX) {
-            holding_regs[HR_CONFIG_VALID] = 1;
-            ESP_LOGI(TAG, "Config válida - período: %d ms", period);
-        } else {
-            ESP_LOGI(TAG, "Config inválida - período: %d ms. Debe estar entre %d y %d ms", period, IMU_SAMPLE_PERIOD_MIN, IMU_SAMPLE_PERIOD_MAX);
-            holding_regs[HR_CONFIG_VALID] = 0;
-            holding_regs[HR_IMU_SAMPLE_PERIOD] = 0;
-        }
-        
-        xSemaphoreGive(hr_mutex);
+    mbc_slave_lock(modbus_ctx); // Tomo mutex de la librería para acceder a los HR
+    uint16_t period = holding_regs[HR_IMU_SAMPLE_PERIOD];
+    if (period >= IMU_SAMPLE_PERIOD_MIN && period <= IMU_SAMPLE_PERIOD_MAX) {
+        holding_regs[HR_CONFIG_VALID] = 1;
+        ESP_LOGI(TAG, "Config válida - período: %d ms", period);
+    } else {
+        ESP_LOGI(TAG, "Config inválida - período: %d ms. Debe estar entre %d y %d ms", period, IMU_SAMPLE_PERIOD_MIN, IMU_SAMPLE_PERIOD_MAX);
+        holding_regs[HR_CONFIG_VALID] = 0;
+        holding_regs[HR_IMU_SAMPLE_PERIOD] = 0;
     }
+    mbc_slave_unlock(modbus_ctx); //libero mutex
 }
