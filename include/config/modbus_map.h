@@ -26,13 +26,14 @@
 #define HR_SYSTEM_STATE         20      // Estado actual del sistema
 #define HR_COMMAND_STATUS       21      // Estado del último comando
 #define HR_ERROR_CODE           22      // Código de error
+#define HR_CONFIG_VALID         23      // Flag de configuración válida (solo lectura)
 
 // Datos IMU (solo lectura por maestro)
 #define HR_IMU_ACCEL_X          30      // Aceleración X
 #define HR_IMU_ACCEL_Y          31      // Aceleración Y
 #define HR_IMU_ACCEL_Z          32      // Aceleración Z
 #define HR_IMU_SAMPLE_COUNT     33      // Contador de muestras
-#define HR_CONFIG_VALID         34       // Flag de configuración válida (solo lectura)
+
 
 
 // ============================================

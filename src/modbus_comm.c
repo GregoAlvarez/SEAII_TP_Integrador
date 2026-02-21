@@ -152,7 +152,7 @@ esp_err_t modbus_comm_start_tasks(void)
         "modbus_comm_events",
         4096,
         NULL,
-        12,             // Prioridad
+        10,             // Prioridad
         &modbus_task_events_handle,
         1               // Core 
     );
@@ -167,7 +167,7 @@ esp_err_t modbus_comm_start_tasks(void)
         "modbus_comm_status",
         4096,
         NULL,
-        12,             // Prioridad
+        10,             // Prioridad
         &modbus_task_status_handle,
         1               // Core 1
     );

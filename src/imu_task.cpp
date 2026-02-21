@@ -98,7 +98,7 @@ esp_err_t imu_task_start(EventGroupHandle_t event_group, QueueHandle_t status_qu
         "imu_task",
         4096,
         NULL,
-        10,             // Prioridad media
+        12,             // Prioridad
         &imu_task_handle,
         1               // Core 1
     );
